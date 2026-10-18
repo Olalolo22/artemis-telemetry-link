@@ -101,7 +101,15 @@ impl Frame {
     }
 
     /// Serializes the frame into wire format with magic header and trailing CRC16.
-    pub fn encode(&self) -> Vec<u8> {
+    /// Strictly verifies payload length bounds to prevent silent truncation.
+    pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
+        if self.payload.len() > MAX_PAYLOAD_LEN {
+            return Err(FrameError::PayloadTooLarge {
+                length: self.payload.len(),
+                max: MAX_PAYLOAD_LEN,
+            });
+        }
+
         let payload_len = self.payload.len() as u16;
         let mut buf = Vec::with_capacity(HEADER_LEN + self.payload.len() + CRC_LEN);
 
@@ -115,7 +123,21 @@ impl Frame {
 
         let calculated_crc = crc16_ccitt(&buf);
         buf.extend_from_slice(&calculated_crc.to_be_bytes());
-        buf
+        Ok(buf)
+    }
+
+    /// Scans a byte buffer for the sync magic word [0xAA, 0x55].
+    /// Useful for re-synchronizing after corrupted frames in continuous byte streams (e.g., UART / Serial).
+    pub fn scan_sync_word(buf: &[u8]) -> Option<usize> {
+        if buf.len() < 2 {
+            return None;
+        }
+        for i in 0..buf.len() - 1 {
+            if buf[i] == SYNC_MAGIC_0 && buf[i + 1] == SYNC_MAGIC_1 {
+                return Some(i);
+            }
+        }
+        None
     }
 
     /// Attempts to decode a single frame from the provided buffer.
@@ -194,7 +216,7 @@ mod tests {
         let payload = b"ALTITUDE_100M_BATTERY_98PCT".to_vec();
         let frame = Frame::new(MsgType::Telemetry, 42, 1729182300000, payload.clone());
 
-        let encoded = frame.encode();
+        let encoded = frame.encode().expect("Encode must succeed");
         assert!(encoded.len() > MIN_FRAME_LEN);
 
         let (decoded, consumed) = Frame::decode(&encoded).expect("Decode must succeed");
@@ -206,10 +228,31 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_payload_exceeding_max_len() {
+        let large_payload = vec![0x42; MAX_PAYLOAD_LEN + 1];
+        let frame = Frame::new(MsgType::Command, 1, 100, large_payload);
+        let res = frame.encode();
+        match res {
+            Err(FrameError::PayloadTooLarge { length, max }) => {
+                assert_eq!(length, MAX_PAYLOAD_LEN + 1);
+                assert_eq!(max, MAX_PAYLOAD_LEN);
+            }
+            other => panic!("Expected PayloadTooLarge error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_scan_sync_word_finds_frame_in_noisy_stream() {
+        let noise = vec![0x12, 0x34, 0x00, 0xFF, SYNC_MAGIC_0, SYNC_MAGIC_1, 0x01];
+        let sync_pos = Frame::scan_sync_word(&noise);
+        assert_eq!(sync_pos, Some(4));
+    }
+
+    #[test]
     fn test_rejects_corrupted_crc() {
         let payload = b"SECRET_MISSION_COMMAND".to_vec();
         let frame = Frame::new(MsgType::Command, 10, 1000, payload);
-        let mut encoded = frame.encode();
+        let mut encoded = frame.encode().expect("Encode failed");
 
         // Corrupt one payload byte
         let payload_idx = HEADER_LEN + 2;
@@ -217,14 +260,14 @@ mod tests {
 
         let res = Frame::decode(&encoded);
         match res {
-            Err(FrameError::CorruptedChecksum { .. }) => {} // Expected
+            Err(FrameError::CorruptedChecksum { .. }) => {}
             other => panic!("Expected CorruptedChecksum error, got {:?}", other),
         }
     }
 
     #[test]
     fn test_rejects_bad_magic() {
-        let mut encoded = Frame::new(MsgType::Heartbeat, 1, 500, vec![]).encode();
+        let mut encoded = Frame::new(MsgType::Heartbeat, 1, 500, vec![]).encode().expect("Encode failed");
         encoded[0] = 0x00; // Invalidate sync word
 
         let res = Frame::decode(&encoded);
@@ -236,8 +279,8 @@ mod tests {
 
     #[test]
     fn test_rejects_truncated_buffer() {
-        let encoded = Frame::new(MsgType::Heartbeat, 1, 500, vec![1, 2, 3]).encode();
-        let truncated = &encoded[..HEADER_LEN]; // Misses payload & CRC
+        let encoded = Frame::new(MsgType::Heartbeat, 1, 500, vec![1, 2, 3]).encode().expect("Encode failed");
+        let truncated = &encoded[..HEADER_LEN];
 
         let res = Frame::decode(truncated);
         match res {

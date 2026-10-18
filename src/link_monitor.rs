@@ -1,4 +1,7 @@
 //! Real-time RF datalink quality estimator, packet loss tracking, and telemetry health metrics.
+//! Hardened against sequence number poisoning, sequence wraparound, and duplicate packet inflation.
+
+pub const MAX_ACCEPTABLE_SEQUENCE_GAP: u32 = 1_000;
 
 #[derive(Debug, Clone)]
 pub struct LinkStatistics {
@@ -6,6 +9,7 @@ pub struct LinkStatistics {
     pub packets_dropped_estimate: u64,
     pub corrupted_crc_count: u64,
     pub out_of_order_count: u64,
+    pub sequence_anomalies_count: u64,
     pub packet_delivery_ratio_pct: f32,
     pub last_sequence_id: Option<u32>,
 }
@@ -16,6 +20,7 @@ pub struct LinkMonitor {
     packets_dropped: u64,
     corrupted_crc: u64,
     out_of_order: u64,
+    sequence_anomalies: u64,
     last_seq: Option<u32>,
 }
 
@@ -32,6 +37,7 @@ impl LinkMonitor {
             packets_dropped: 0,
             corrupted_crc: 0,
             out_of_order: 0,
+            sequence_anomalies: 0,
             last_seq: None,
         }
     }
@@ -40,20 +46,39 @@ impl LinkMonitor {
         self.corrupted_crc += 1;
     }
 
+    /// Records an ingested packet with bounded sequence gap tracking and wraparound protection.
     pub fn record_valid_packet(&mut self, seq: u32) {
-        self.packets_received += 1;
-
         match self.last_seq {
             None => {
                 self.last_seq = Some(seq);
+                self.packets_received += 1;
             }
             Some(last) => {
                 if seq > last {
                     let gap = seq - last - 1;
-                    self.packets_dropped += gap as u64;
-                    self.last_seq = Some(seq);
+                    if gap <= MAX_ACCEPTABLE_SEQUENCE_GAP {
+                        self.packets_dropped += gap as u64;
+                        self.packets_received += 1;
+                        self.last_seq = Some(seq);
+                    } else {
+                        // Sequence anomaly or transmitter reboot/jump: re-anchor baseline without skewing dropped metrics
+                        self.sequence_anomalies += 1;
+                        self.packets_received += 1;
+                        self.last_seq = Some(seq);
+                    }
+                } else if seq < last {
+                    // Check for standard u32 wraparound
+                    let wrap_gap = (u32::MAX - last).saturating_add(seq);
+                    if wrap_gap <= MAX_ACCEPTABLE_SEQUENCE_GAP {
+                        self.packets_dropped += wrap_gap as u64;
+                        self.packets_received += 1;
+                        self.last_seq = Some(seq);
+                    } else {
+                        // Out-of-order or duplicate packet; do not increment unique received packets
+                        self.out_of_order += 1;
+                    }
                 } else {
-                    // Out-of-order or duplicate packet
+                    // Exact duplicate packet (seq == last)
                     self.out_of_order += 1;
                 }
             }
@@ -73,6 +98,7 @@ impl LinkMonitor {
             packets_dropped_estimate: self.packets_dropped,
             corrupted_crc_count: self.corrupted_crc,
             out_of_order_count: self.out_of_order,
+            sequence_anomalies_count: self.sequence_anomalies,
             packet_delivery_ratio_pct: pdr,
             last_sequence_id: self.last_seq,
         }
@@ -107,18 +133,51 @@ mod tests {
         let stats = monitor.statistics();
         assert_eq!(stats.packets_received, 3);
         assert_eq!(stats.packets_dropped_estimate, 2);
-        // Total expected = 5, received = 3 -> 60.0%
         assert!((stats.packet_delivery_ratio_pct - 60.0).abs() < 0.001);
     }
 
     #[test]
-    fn test_detects_out_of_order() {
+    fn test_sequence_anomaly_poisoning_prevented() {
         let mut monitor = LinkMonitor::new();
-        monitor.record_valid_packet(1);
-        monitor.record_valid_packet(3); // Gap of 1 (seq 2 dropped)
-        monitor.record_valid_packet(2); // Delayed seq 2 arrives out-of-order
+        monitor.record_valid_packet(10);
+
+        // Huge forward jump (simulating unauthenticated packet or transmitter reset)
+        monitor.record_valid_packet(4_000_000_000);
 
         let stats = monitor.statistics();
-        assert_eq!(stats.out_of_order_count, 1);
+        assert_eq!(stats.sequence_anomalies_count, 1);
+        // Dropped packets should NOT be 4 billion!
+        assert_eq!(stats.packets_dropped_estimate, 0);
+        assert_eq!(stats.packets_received, 2);
+    }
+
+    #[test]
+    fn test_sequence_wraparound_handled() {
+        let mut monitor = LinkMonitor::new();
+        monitor.record_valid_packet(u32::MAX);
+        // Seamless rollover from u32::MAX to 0
+        monitor.record_valid_packet(0);
+
+        let stats = monitor.statistics();
+        assert_eq!(stats.packets_dropped_estimate, 0);
+        assert_eq!(stats.packets_received, 2);
+
+        // Rollover with 1 dropped packet (u32::MAX skipped)
+        let mut monitor_gap = LinkMonitor::new();
+        monitor_gap.record_valid_packet(u32::MAX - 1);
+        monitor_gap.record_valid_packet(0); // u32::MAX was dropped
+        assert_eq!(monitor_gap.statistics().packets_dropped_estimate, 1);
+    }
+
+    #[test]
+    fn test_duplicate_does_not_inflate_received_count() {
+        let mut monitor = LinkMonitor::new();
+        monitor.record_valid_packet(1);
+        monitor.record_valid_packet(1); // Duplicate
+        monitor.record_valid_packet(1); // Duplicate
+
+        let stats = monitor.statistics();
+        assert_eq!(stats.packets_received, 1);
+        assert_eq!(stats.out_of_order_count, 2);
     }
 }

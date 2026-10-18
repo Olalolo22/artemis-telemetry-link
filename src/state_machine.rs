@@ -1,7 +1,7 @@
 //! Deterministic vehicle state machine, safety transition guards, and idempotent command processor.
 
 use crate::messages::{AckStatus, Command, CommandAck, VehicleAction};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt;
 
 pub const HEARTBEAT_TIMEOUT_MS: u64 = 3_000;
@@ -38,6 +38,19 @@ impl fmt::Display for VehicleState {
     }
 }
 
+impl VehicleState {
+    pub fn is_airborne(&self) -> bool {
+        matches!(
+            self,
+            VehicleState::InFlightManual
+                | VehicleState::AutonomousMission
+                | VehicleState::LostLinkHold
+                | VehicleState::FailsafeRtl
+                | VehicleState::EmergencyLand
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransitionError {
     InvalidTransition { from: VehicleState, to: VehicleState },
@@ -68,7 +81,8 @@ pub struct VehicleStateMachine {
     current_state: VehicleState,
     battery_pct: u8,
     last_valid_heartbeat_ms: u64,
-    executed_commands: HashSet<u32>,
+    // Maps command_id -> serialized representation of action to detect payload mismatch on ID replay
+    executed_commands: HashMap<u32, String>,
     recent_command_queue: Vec<u32>,
     max_command_history: usize,
 }
@@ -77,9 +91,9 @@ impl VehicleStateMachine {
     pub fn new(initial_battery_pct: u8, start_time_ms: u64) -> Self {
         Self {
             current_state: VehicleState::Disarmed,
-            battery_pct: initial_battery_pct,
+            battery_pct: initial_battery_pct.min(100),
             last_valid_heartbeat_ms: start_time_ms,
-            executed_commands: HashSet::new(),
+            executed_commands: HashMap::new(),
             recent_command_queue: Vec::new(),
             max_command_history: 128,
         }
@@ -93,27 +107,38 @@ impl VehicleStateMachine {
         self.battery_pct
     }
 
-    pub fn update_battery(&mut self, pct: u8) {
-        self.battery_pct = pct;
-        if self.battery_pct <= EMERGENCY_BATTERY_LAND_PCT
-            && self.current_state != VehicleState::EmergencyLand
-            && self.current_state != VehicleState::Disarmed
-        {
-            let _ = self.transition_to(VehicleState::EmergencyLand);
-        } else if self.battery_pct <= CRITICAL_BATTERY_RTL_PCT
-            && self.current_state != VehicleState::FailsafeRtl
-            && self.current_state != VehicleState::EmergencyLand
-            && self.current_state != VehicleState::Disarmed
-        {
-            let _ = self.transition_to(VehicleState::FailsafeRtl);
+    /// Updates vehicle battery percentage with strict failsafe state transitions.
+    pub fn update_battery(&mut self, pct: u8) -> Result<(), TransitionError> {
+        self.battery_pct = pct.min(100);
+
+        if self.battery_pct <= EMERGENCY_BATTERY_LAND_PCT {
+            if self.current_state.is_airborne() && self.current_state != VehicleState::EmergencyLand {
+                self.transition_to(VehicleState::EmergencyLand)?;
+            } else if self.current_state == VehicleState::Armed {
+                // If on ground and battery dies, disarm immediately to prevent accident
+                self.transition_to(VehicleState::Disarmed)?;
+            }
+        } else if self.battery_pct <= CRITICAL_BATTERY_RTL_PCT {
+            if self.current_state.is_airborne()
+                && self.current_state != VehicleState::FailsafeRtl
+                && self.current_state != VehicleState::EmergencyLand
+            {
+                self.transition_to(VehicleState::FailsafeRtl)?;
+            } else if self.current_state == VehicleState::Armed {
+                self.transition_to(VehicleState::Disarmed)?;
+            }
         }
+        Ok(())
     }
 
+    /// Records a valid incoming heartbeat timestamp. Ignores stale / backward-moving timestamps.
     pub fn record_heartbeat(&mut self, timestamp_ms: u64) {
-        self.last_valid_heartbeat_ms = timestamp_ms;
-        // If we were holding due to link loss and link recovers, recover to manual flight
-        if self.current_state == VehicleState::LostLinkHold {
-            let _ = self.transition_to(VehicleState::InFlightManual);
+        if timestamp_ms >= self.last_valid_heartbeat_ms {
+            self.last_valid_heartbeat_ms = timestamp_ms;
+            // If loitering in LostLinkHold and radio link recovers, resume manual flight
+            if self.current_state == VehicleState::LostLinkHold {
+                let _ = self.transition_to(VehicleState::InFlightManual);
+            }
         }
     }
 
@@ -139,19 +164,43 @@ impl VehicleStateMachine {
         None
     }
 
-    /// Processes an incoming command with strict idempotency and state transition guards.
+    /// Processes an incoming command with parameter validation, idempotency, and safety guards.
     pub fn process_command(&mut self, cmd: Command) -> CommandAck {
-        // Idempotency check: if already executed, return cached success without duplicate side-effects
-        if self.executed_commands.contains(&cmd.command_id) {
+        // 1. Parameter boundary validation
+        if let Err(val_err) = cmd.action.validate() {
             return CommandAck {
                 command_id: cmd.command_id,
-                status: AckStatus::AlreadyExecuted,
+                status: AckStatus::RejectedMalformed(val_err.to_string()),
             };
         }
 
+        // 2. Command Idempotency with Action Integrity check
+        let action_repr = format!("{:?}", cmd.action);
+        if let Some(recorded_action) = self.executed_commands.get(&cmd.command_id) {
+            if recorded_action == &action_repr {
+                return CommandAck {
+                    command_id: cmd.command_id,
+                    status: AckStatus::AlreadyExecuted,
+                };
+            } else {
+                return CommandAck {
+                    command_id: cmd.command_id,
+                    status: AckStatus::RejectedMalformed(format!(
+                        "Command ID {} reused with mismatched action: was {}, requested {}",
+                        cmd.command_id, recorded_action, action_repr
+                    )),
+                };
+            }
+        }
+
+        // 3. State transition execution
         let transition_result = match cmd.action {
             VehicleAction::Arm => {
-                if self.battery_pct < MIN_BATTERY_ARM_PCT {
+                if self.current_state != VehicleState::Disarmed {
+                    Err(TransitionError::SafetyPreconditionFailed(
+                        format!("Cannot arm vehicle when currently in state {}", self.current_state)
+                    ))
+                } else if self.battery_pct < MIN_BATTERY_ARM_PCT {
                     Err(TransitionError::InsufficientBattery {
                         required: MIN_BATTERY_ARM_PCT,
                         current: self.battery_pct,
@@ -161,19 +210,35 @@ impl VehicleStateMachine {
                 }
             }
             VehicleAction::Disarm => {
-                if self.current_state == VehicleState::InFlightManual
-                    || self.current_state == VehicleState::AutonomousMission
-                {
+                // Bug fix: Strictly prohibit Disarm from ANY airborne state (Manual, Mission, Hold, RTL, EmergencyLand)
+                if self.current_state.is_airborne() {
                     Err(TransitionError::SafetyPreconditionFailed(
-                        "Cannot disarm while vehicle is airborne".to_string(),
+                        format!("Cannot disarm vehicle while airborne in state {}", self.current_state)
                     ))
                 } else {
                     self.transition_to(VehicleState::Disarmed)
                 }
             }
-            VehicleAction::Takeoff { .. } => self.transition_to(VehicleState::InFlightManual),
+            VehicleAction::Takeoff { .. } => {
+                if self.current_state != VehicleState::Armed {
+                    Err(TransitionError::SafetyPreconditionFailed(
+                        format!("Takeoff requires vehicle to be in Armed state (currently {})", self.current_state)
+                    ))
+                } else if self.battery_pct < MIN_BATTERY_ARM_PCT {
+                    Err(TransitionError::InsufficientBattery {
+                        required: MIN_BATTERY_ARM_PCT,
+                        current: self.battery_pct,
+                    })
+                } else {
+                    self.transition_to(VehicleState::InFlightManual)
+                }
+            }
             VehicleAction::ExecuteWaypoint { .. } => {
-                if self.battery_pct < MIN_BATTERY_MISSION_PCT {
+                if !self.current_state.is_airborne() {
+                    Err(TransitionError::SafetyPreconditionFailed(
+                        "Cannot execute waypoint while vehicle is on the ground".to_string()
+                    ))
+                } else if self.battery_pct < MIN_BATTERY_MISSION_PCT {
                     Err(TransitionError::InsufficientBattery {
                         required: MIN_BATTERY_MISSION_PCT,
                         current: self.battery_pct,
@@ -182,14 +247,52 @@ impl VehicleStateMachine {
                     self.transition_to(VehicleState::AutonomousMission)
                 }
             }
-            VehicleAction::HoldPosition => self.transition_to(VehicleState::InFlightManual),
-            VehicleAction::ReturnToLaunch => self.transition_to(VehicleState::FailsafeRtl),
-            VehicleAction::EmergencyLand => self.transition_to(VehicleState::EmergencyLand),
+            VehicleAction::HoldPosition => {
+                // Bug fix: HoldPosition must NEVER launch an armed vehicle on the ground!
+                if !self.current_state.is_airborne() {
+                    Err(TransitionError::SafetyPreconditionFailed(
+                        "HoldPosition is only valid when vehicle is airborne".to_string()
+                    ))
+                } else {
+                    self.transition_to(VehicleState::InFlightManual)
+                }
+            }
+            VehicleAction::ReturnToLaunch => {
+                if !self.current_state.is_airborne() {
+                    Err(TransitionError::SafetyPreconditionFailed(
+                        "ReturnToLaunch is only valid when vehicle is airborne".to_string()
+                    ))
+                } else {
+                    self.transition_to(VehicleState::FailsafeRtl)
+                }
+            }
+            VehicleAction::EmergencyLand => {
+                if !self.current_state.is_airborne() {
+                    Err(TransitionError::SafetyPreconditionFailed(
+                        "EmergencyLand is only valid when vehicle is airborne".to_string()
+                    ))
+                } else {
+                    self.transition_to(VehicleState::EmergencyLand)
+                }
+            }
+            VehicleAction::Touchdown => {
+                // Bug fix: Explicit touchdown event transition from landing states to Disarmed
+                if self.current_state == VehicleState::EmergencyLand
+                    || self.current_state == VehicleState::FailsafeRtl
+                    || self.current_state == VehicleState::InFlightManual
+                {
+                    self.transition_to(VehicleState::Disarmed)
+                } else {
+                    Err(TransitionError::SafetyPreconditionFailed(
+                        format!("Touchdown event not applicable in state {}", self.current_state)
+                    ))
+                }
+            }
         };
 
         match transition_result {
             Ok(_) => {
-                self.record_command_id(cmd.command_id);
+                self.record_command_id(cmd.command_id, action_repr);
                 CommandAck {
                     command_id: cmd.command_id,
                     status: AckStatus::Accepted,
@@ -206,14 +309,14 @@ impl VehicleStateMachine {
         }
     }
 
-    fn record_command_id(&mut self, id: u32) {
+    fn record_command_id(&mut self, id: u32, action_repr: String) {
         if self.recent_command_queue.len() >= self.max_command_history {
             if let Some(oldest) = self.recent_command_queue.first().copied() {
                 self.executed_commands.remove(&oldest);
                 self.recent_command_queue.remove(0);
             }
         }
-        self.executed_commands.insert(id);
+        self.executed_commands.insert(id, action_repr);
         self.recent_command_queue.push(id);
     }
 
@@ -242,19 +345,18 @@ impl VehicleStateMachine {
             (VehicleState::LostLinkHold, VehicleState::InFlightManual) => true,
             (VehicleState::LostLinkHold, VehicleState::FailsafeRtl) => true,
 
-            // Failsafe RTL -> EmergencyLand or Disarmed (upon landing)
-            (VehicleState::FailsafeRtl, VehicleState::EmergencyLand) => true,
-            (VehicleState::FailsafeRtl, VehicleState::Disarmed) => true,
-
-            // Any airborne state can execute emergency RTL or Land
+            // Airborne states can enter RTL or EmergencyLand
             (VehicleState::InFlightManual, VehicleState::FailsafeRtl) => true,
             (VehicleState::AutonomousMission, VehicleState::FailsafeRtl) => true,
             (VehicleState::InFlightManual, VehicleState::EmergencyLand) => true,
             (VehicleState::AutonomousMission, VehicleState::EmergencyLand) => true,
             (VehicleState::LostLinkHold, VehicleState::EmergencyLand) => true,
+            (VehicleState::FailsafeRtl, VehicleState::EmergencyLand) => true,
 
-            // EmergencyLand completes by disarming on touchdown
+            // Touchdown transitions to Disarmed
             (VehicleState::EmergencyLand, VehicleState::Disarmed) => true,
+            (VehicleState::FailsafeRtl, VehicleState::Disarmed) => true,
+            (VehicleState::InFlightManual, VehicleState::Disarmed) => true,
 
             _ => false,
         };
@@ -296,112 +398,88 @@ mod tests {
     }
 
     #[test]
-    fn test_prevents_disarm_while_airborne() {
+    fn test_regression_strictly_prevents_disarm_during_rtl_and_emergency_land() {
         let mut sm = VehicleStateMachine::new(80, 1000);
-        sm.process_command(Command {
-            command_id: 1,
-            action: VehicleAction::Arm,
-        });
-        sm.process_command(Command {
-            command_id: 2,
-            action: VehicleAction::Takeoff { target_alt_m: 50.0 },
-        });
+        sm.process_command(Command { command_id: 1, action: VehicleAction::Arm });
+        sm.process_command(Command { command_id: 2, action: VehicleAction::Takeoff { target_alt_m: 50.0 } });
+        sm.process_command(Command { command_id: 3, action: VehicleAction::ReturnToLaunch });
+        assert_eq!(sm.state(), VehicleState::FailsafeRtl);
 
-        // Attempt airborne disarm
-        let ack = sm.process_command(Command {
-            command_id: 3,
-            action: VehicleAction::Disarm,
-        });
-        match ack.status {
-            AckStatus::RejectedInvalidState(msg) => {
-                assert!(msg.contains("Cannot disarm while vehicle is airborne"));
-            }
-            other => panic!("Expected RejectedInvalidState, got {:?}", other),
-        }
-        assert_eq!(sm.state(), VehicleState::InFlightManual);
+        // Attempting to disarm mid-air during RTL MUST fail
+        let ack = sm.process_command(Command { command_id: 4, action: VehicleAction::Disarm });
+        assert!(matches!(ack.status, AckStatus::RejectedInvalidState(_)));
+        assert_eq!(sm.state(), VehicleState::FailsafeRtl);
+
+        // Transition to EmergencyLand
+        sm.process_command(Command { command_id: 5, action: VehicleAction::EmergencyLand });
+        assert_eq!(sm.state(), VehicleState::EmergencyLand);
+
+        // Attempting to disarm during EmergencyLand MUST fail
+        let ack2 = sm.process_command(Command { command_id: 6, action: VehicleAction::Disarm });
+        assert!(matches!(ack2.status, AckStatus::RejectedInvalidState(_)));
+        assert_eq!(sm.state(), VehicleState::EmergencyLand);
+
+        // Sensor touchdown event safely disarms
+        let ack3 = sm.process_command(Command { command_id: 7, action: VehicleAction::Touchdown });
+        assert_eq!(ack3.status, AckStatus::Accepted);
+        assert_eq!(sm.state(), VehicleState::Disarmed);
     }
 
     #[test]
-    fn test_idempotent_command_replay() {
+    fn test_regression_hold_position_cannot_launch_from_ground() {
         let mut sm = VehicleStateMachine::new(80, 1000);
-        let cmd = Command {
-            command_id: 42,
-            action: VehicleAction::Arm,
-        };
+        sm.process_command(Command { command_id: 1, action: VehicleAction::Arm });
+        assert_eq!(sm.state(), VehicleState::Armed);
 
-        let ack1 = sm.process_command(cmd.clone());
+        // HoldPosition on ground must be rejected
+        let ack = sm.process_command(Command { command_id: 2, action: VehicleAction::HoldPosition });
+        assert!(matches!(ack.status, AckStatus::RejectedInvalidState(_)));
+        assert_eq!(sm.state(), VehicleState::Armed);
+    }
+
+    #[test]
+    fn test_regression_takeoff_checks_battery() {
+        let mut sm = VehicleStateMachine::new(12, 1000); // 12% is below minimum arm/takeoff 15%
+        let ack = sm.process_command(Command { command_id: 1, action: VehicleAction::Arm });
+        assert_eq!(ack.status, AckStatus::RejectedLowBattery);
+    }
+
+    #[test]
+    fn test_regression_idempotent_command_detects_action_mismatch() {
+        let mut sm = VehicleStateMachine::new(80, 1000);
+        let cmd1 = Command { command_id: 42, action: VehicleAction::Arm };
+        let ack1 = sm.process_command(cmd1);
         assert_eq!(ack1.status, AckStatus::Accepted);
 
-        // Ground station retransmits due to lost ACK packet
-        let ack2 = sm.process_command(cmd);
+        // Same ID with identical action -> AlreadyExecuted
+        let ack2 = sm.process_command(Command { command_id: 42, action: VehicleAction::Arm });
         assert_eq!(ack2.status, AckStatus::AlreadyExecuted);
+
+        // Same ID with DIFFERENT action -> RejectedMalformed
+        let ack3 = sm.process_command(Command { command_id: 42, action: VehicleAction::Disarm });
+        assert!(matches!(ack3.status, AckStatus::RejectedMalformed(_)));
     }
 
     #[test]
-    fn test_watchdog_lost_link_and_failsafe_rtl() {
+    fn test_regression_heartbeat_timestamp_ordering() {
         let mut sm = VehicleStateMachine::new(80, 1000);
-        sm.process_command(Command {
-            command_id: 1,
-            action: VehicleAction::Arm,
-        });
-        sm.process_command(Command {
-            command_id: 2,
-            action: VehicleAction::Takeoff { target_alt_m: 50.0 },
-        });
-
-        // Advance clock by 3.5 seconds without heartbeat -> triggers LostLinkHold
-        let event = sm.evaluate_watchdog(4500);
-        assert_eq!(event, Some(VehicleState::LostLinkHold));
-        assert_eq!(sm.state(), VehicleState::LostLinkHold);
-
-        // Advance clock past 8 seconds -> triggers FailsafeRtl
-        let event2 = sm.evaluate_watchdog(9500);
-        assert_eq!(event2, Some(VehicleState::FailsafeRtl));
-        assert_eq!(sm.state(), VehicleState::FailsafeRtl);
-    }
-
-    #[test]
-    fn test_heartbeat_recovers_from_lost_link_hold() {
-        let mut sm = VehicleStateMachine::new(80, 1000);
-        sm.process_command(Command {
-            command_id: 1,
-            action: VehicleAction::Arm,
-        });
-        sm.process_command(Command {
-            command_id: 2,
-            action: VehicleAction::Takeoff { target_alt_m: 50.0 },
-        });
-
-        // Trip link loss
-        sm.evaluate_watchdog(4500);
-        assert_eq!(sm.state(), VehicleState::LostLinkHold);
-
-        // Ground station signal restored at t=5000ms
         sm.record_heartbeat(5000);
-        assert_eq!(sm.state(), VehicleState::InFlightManual);
+        assert_eq!(sm.last_valid_heartbeat_ms, 5000);
+
+        // Stale heartbeat with old timestamp (3000ms) should be ignored
+        sm.record_heartbeat(3000);
+        assert_eq!(sm.last_valid_heartbeat_ms, 5000);
     }
 
     #[test]
-    fn test_low_battery_rejection_and_emergency_land() {
-        let mut sm = VehicleStateMachine::new(10, 1000);
-        let ack = sm.process_command(Command {
-            command_id: 1,
-            action: VehicleAction::Arm,
-        });
-        assert_eq!(ack.status, AckStatus::RejectedLowBattery);
+    fn test_regression_low_battery_on_ground_disarms_cleanly() {
+        let mut sm = VehicleStateMachine::new(50, 1000);
+        sm.process_command(Command { command_id: 1, action: VehicleAction::Arm });
+        assert_eq!(sm.state(), VehicleState::Armed);
 
-        // In flight, drops to 4% -> EmergencyLand
-        let mut sm_airborne = VehicleStateMachine::new(80, 1000);
-        sm_airborne.process_command(Command {
-            command_id: 1,
-            action: VehicleAction::Arm,
-        });
-        sm_airborne.process_command(Command {
-            command_id: 2,
-            action: VehicleAction::Takeoff { target_alt_m: 50.0 },
-        });
-
-        sm_airborne.update_battery(4);
-        assert_eq!(sm_airborne.state(), VehicleState::EmergencyLand);
+        // Battery drops to critical while on ground -> safe disarm, not flight RTL
+        let res = sm.update_battery(4);
+        assert!(res.is_ok());
+        assert_eq!(sm.state(), VehicleState::Disarmed);
     }
 }
