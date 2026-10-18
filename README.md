@@ -1,10 +1,10 @@
-# Artemis Telemetry Link & Failsafe Daemon
+# Artemis Telemetry Link & Failsafe Prototype
 
-> High-reliability binary datalink framing, real-time RF link quality estimation, HMAC-SHA256 command authentication, and deterministic failsafe state machine for unmanned vehicles (UAV / UGV) operating over lossy communications channels.
+> A systems prototype in Rust: binary datalink framing, lossy RF link quality estimation, HMAC-SHA256 command authentication, and deterministic failsafe state machine for unmanned platforms (UAV / UGV).
 
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-29%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-30%20passed-brightgreen.svg)]()
 
 ---
 
@@ -14,8 +14,8 @@ Autonomous unmanned platforms (such as long-range surveillance drones and autono
 
 If vehicle systems software is built naively, corrupted bytes can trigger uncommanded maneuvers, stale telemetry piles up, or an unauthenticated adversary on the same frequency can inject disarm commands.
 
-`artemis-telemetry-link` is a high-reliability vehicle systems prototype built in Rust. It implements:
-1. **Zero-panic binary datalink framing** with sync words, monotonic sequence numbering, bounds checks, and CRC-16-CCITT frame validation.
+`artemis-telemetry-link` is a vehicle systems software prototype built in Rust to model datalink communications, lossy channel recovery, and fail-safe state transitions. It implements:
+1. **Binary datalink framing codec** with sync words (`0xAA55`), monotonic sequence numbering, bounds checks, and CRC-16-CCITT integrity verification.
 2. **HMAC-SHA256 command authentication & anti-replay** (modeling MAVLink 2 message signing) with 128-bit truncated MACs, session isolation, and temporal replay windows.
 3. **Real-time RF link quality estimator** tracking Packet Delivery Ratio (PDR), sequence anomalies, wraparound rollovers, and bit-flip rejections.
 4. **Deterministic vehicle state machine** enforcing strict safety invariants: no airborne disarms without touchdown, ground hold protection, battery guards, and heartbeat watchdog fail-safes.

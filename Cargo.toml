@@ -3,7 +3,7 @@ name = "artemis-telemetry-link"
 version = "0.1.0"
 edition = "2021"
 authors = ["Olumide Lala"]
-description = "High-reliability vehicle telemetry framing, lossy datalink monitor, and deterministic failsafe state machine for autonomous platforms."
+description = "A systems prototype in Rust: binary datalink framing, RF link monitoring, HMAC command authentication, and failsafe state machine for unmanned platforms."
 
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }
