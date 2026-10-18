@@ -85,6 +85,7 @@ pub struct VehicleStateMachine {
     executed_commands: HashMap<u32, String>,
     recent_command_queue: Vec<u32>,
     max_command_history: usize,
+    pre_loss_state: Option<VehicleState>,
 }
 
 impl VehicleStateMachine {
@@ -96,6 +97,7 @@ impl VehicleStateMachine {
             executed_commands: HashMap::new(),
             recent_command_queue: Vec::new(),
             max_command_history: 128,
+            pre_loss_state: None,
         }
     }
 
@@ -132,12 +134,14 @@ impl VehicleStateMachine {
     }
 
     /// Records a valid incoming heartbeat timestamp. Ignores stale / backward-moving timestamps.
+    /// If recovering from LostLinkHold, restores the operational mode (InFlightManual or AutonomousMission)
+    /// that was active prior to link loss.
     pub fn record_heartbeat(&mut self, timestamp_ms: u64) {
         if timestamp_ms >= self.last_valid_heartbeat_ms {
             self.last_valid_heartbeat_ms = timestamp_ms;
-            // If loitering in LostLinkHold and radio link recovers, resume manual flight
             if self.current_state == VehicleState::LostLinkHold {
-                let _ = self.transition_to(VehicleState::InFlightManual);
+                let target_mode = self.pre_loss_state.take().unwrap_or(VehicleState::InFlightManual);
+                let _ = self.transition_to(target_mode);
             }
         }
     }
@@ -149,6 +153,7 @@ impl VehicleStateMachine {
         match self.current_state {
             VehicleState::InFlightManual | VehicleState::AutonomousMission => {
                 if elapsed >= HEARTBEAT_TIMEOUT_MS {
+                    self.pre_loss_state = Some(self.current_state);
                     let _ = self.transition_to(VehicleState::LostLinkHold);
                     return Some(self.current_state);
                 }
@@ -341,8 +346,9 @@ impl VehicleStateMachine {
             (VehicleState::InFlightManual, VehicleState::LostLinkHold) => true,
             (VehicleState::AutonomousMission, VehicleState::LostLinkHold) => true,
 
-            // LostLinkHold -> InFlightManual (Link recovery) or FailsafeRtl (Timeout)
+            // LostLinkHold -> InFlightManual / AutonomousMission (Link recovery) or FailsafeRtl (Timeout)
             (VehicleState::LostLinkHold, VehicleState::InFlightManual) => true,
+            (VehicleState::LostLinkHold, VehicleState::AutonomousMission) => true,
             (VehicleState::LostLinkHold, VehicleState::FailsafeRtl) => true,
 
             // Airborne states can enter RTL or EmergencyLand
@@ -481,5 +487,31 @@ mod tests {
         let res = sm.update_battery(4);
         assert!(res.is_ok());
         assert_eq!(sm.state(), VehicleState::Disarmed);
+    }
+
+    #[test]
+    fn test_regression_link_recovery_restores_autonomous_mission() {
+        let mut sm = VehicleStateMachine::new(80, 1000);
+        sm.process_command(Command { command_id: 1, action: VehicleAction::Arm });
+        sm.process_command(Command { command_id: 2, action: VehicleAction::Takeoff { target_alt_m: 50.0 } });
+        sm.process_command(Command {
+            command_id: 3,
+            action: VehicleAction::ExecuteWaypoint {
+                waypoint_id: 1,
+                lat: 9.0765,
+                lon: 7.3986,
+                alt_m: 100.0,
+            },
+        });
+        assert_eq!(sm.state(), VehicleState::AutonomousMission);
+
+        // Heartbeat timeout occurs -> enters LostLinkHold
+        let event = sm.evaluate_watchdog(4500);
+        assert_eq!(event, Some(VehicleState::LostLinkHold));
+        assert_eq!(sm.state(), VehicleState::LostLinkHold);
+
+        // Ground station signal restored at t=5000ms -> restores AutonomousMission!
+        sm.record_heartbeat(5000);
+        assert_eq!(sm.state(), VehicleState::AutonomousMission);
     }
 }
